@@ -19,7 +19,7 @@
 
 Not a defect:
 - The base use of `mongomock` / `MongoClient` with `tz_aware=True` was sound; the issue was not the database library, but the date coercion path when reading sample documents that arrived in Extended JSON form.
-- The single-file architecture was not a problem; it matched the assignment requirement that all logic live in `app/main.py`.
+- The API is organized into one module per endpoint under `app/api/endpoints/`; shared attendance rules, MongoDB pipelines, validation schemas, and database setup remain in dedicated modules rather than being duplicated across handlers.
 - The use of unique indexes on `emp_code` and `(emp_code, date)` was correct and required for correctness under concurrent creates and duplicate punch-ins.
 
 ### Overnight lateness regression investigation

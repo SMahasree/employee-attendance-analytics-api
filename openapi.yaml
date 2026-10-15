@@ -4,7 +4,8 @@ info:
   version: 2.0.0
   description: |
     Contract for the HROne engineering assignment. Your FastAPI app must follow this document exactly: paths, methods,
-    parameter names, status codes and response field names. All code lives in `app/main.py` and must start with
+    parameter names, status codes and response field names. The ASGI entry point is `app/main.py`; application
+    concerns are organized into API, domain, schema, configuration, and database modules. Start with
     `uvicorn app.main:app --port 8000`.
 
     **Where things are defined.** This file defines the HTTP contract and the business rules R1-R10. What is stored in

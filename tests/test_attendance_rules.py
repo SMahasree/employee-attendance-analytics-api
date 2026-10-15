@@ -5,7 +5,17 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 from tests import support
-from app import main as api
+from app.api.endpoints import (
+    attendance_list,
+    attendance_punch_in,
+    attendance_punch_out,
+    attendance_regularize,
+    employees_create,
+    employees_list,
+)
+from app.core import database
+from app.domain import attendance as rules
+from app.schemas import EmployeeCreate, PunchInRequest, PunchOutRequest, RegularizeRequest
 
 try:
     import mongomock
@@ -21,18 +31,18 @@ class TimestampAndShiftTests(unittest.TestCase):
     employee = {"emp_code": "EMP99904", "shift_start": "22:00", "shift_end": "06:00"}
 
     def test_reported_timestamp_decodes_to_the_instant_that_was_sent(self):
-        submitted = api.epoch_ms_to_datetime(1791929700000)
+        submitted = rules.epoch_ms_to_datetime(1791929700000)
 
         self.assertEqual(submitted.isoformat(), "2026-10-13T22:15:00+00:00")
-        self.assertEqual(submitted.astimezone(api.IST).isoformat(), "2026-10-14T03:45:00+05:30")
-        self.assertEqual(api.compute_late_minutes(self.employee, submitted), 345)
+        self.assertEqual(submitted.astimezone(rules.IST).isoformat(), "2026-10-14T03:45:00+05:30")
+        self.assertEqual(rules.compute_late_minutes(self.employee, submitted), 345)
 
     def test_correct_2215_ist_epoch_has_fifteen_minutes_lateness(self):
-        submitted = api.epoch_ms_to_datetime(1791909900000)
+        submitted = rules.epoch_ms_to_datetime(1791909900000)
 
-        self.assertEqual(submitted.astimezone(api.IST).isoformat(), "2026-10-13T22:15:00+05:30")
-        self.assertEqual(api.get_shift_context_for_datetime(self.employee, submitted)["record_date"], "2026-10-13")
-        self.assertEqual(api.compute_late_minutes(self.employee, submitted), 15)
+        self.assertEqual(submitted.astimezone(rules.IST).isoformat(), "2026-10-13T22:15:00+05:30")
+        self.assertEqual(rules.get_shift_context_for_datetime(self.employee, submitted)["record_date"], "2026-10-13")
+        self.assertEqual(rules.compute_late_minutes(self.employee, submitted), 15)
 
     def test_overnight_lateness_boundaries_and_preceding_shift_date(self):
         cases = [
@@ -46,69 +56,69 @@ class TimestampAndShiftTests(unittest.TestCase):
         for timestamp, expected_late, expected_date in cases:
             with self.subTest(timestamp=timestamp):
                 instant = local_instant(timestamp)
-                context = api.get_shift_context_for_datetime(self.employee, instant)
+                context = rules.get_shift_context_for_datetime(self.employee, instant)
                 self.assertEqual(context["record_date"], expected_date)
-                self.assertEqual(api.compute_late_minutes(self.employee, instant), expected_late)
+                self.assertEqual(rules.compute_late_minutes(self.employee, instant), expected_late)
 
     def test_day_shift_grace_period_boundary(self):
         employee = {"emp_code": "EMP90001", "shift_start": "09:30", "shift_end": "18:30"}
 
-        self.assertEqual(api.compute_late_minutes(employee, local_instant("2026-10-12T09:40:00+05:30")), 0)
-        self.assertEqual(api.compute_late_minutes(employee, local_instant("2026-10-12T09:40:01+05:30")), 10)
+        self.assertEqual(rules.compute_late_minutes(employee, local_instant("2026-10-12T09:40:00+05:30")), 0)
+        self.assertEqual(rules.compute_late_minutes(employee, local_instant("2026-10-12T09:40:01+05:30")), 10)
 
     def test_overnight_work_hours_and_overtime_threshold(self):
         punch_in = local_instant("2026-10-13T22:00:00+05:30")
         shift_end = local_instant("2026-10-14T06:00:00+05:30")
 
-        self.assertEqual(api.compute_work_hours(punch_in, shift_end + timedelta(minutes=30)), 8.5)
-        self.assertEqual(api.compute_overtime_minutes(self.employee, shift_end + timedelta(minutes=29, seconds=59), punch_in), 0)
-        self.assertEqual(api.compute_overtime_minutes(self.employee, shift_end + timedelta(minutes=30), punch_in), 30)
-        self.assertEqual(api.compute_overtime_minutes(self.employee, shift_end + timedelta(minutes=30, seconds=59), punch_in), 30)
+        self.assertEqual(rules.compute_work_hours(punch_in, shift_end + timedelta(minutes=30)), 8.5)
+        self.assertEqual(rules.compute_overtime_minutes(self.employee, shift_end + timedelta(minutes=29, seconds=59), punch_in), 0)
+        self.assertEqual(rules.compute_overtime_minutes(self.employee, shift_end + timedelta(minutes=30), punch_in), 30)
+        self.assertEqual(rules.compute_overtime_minutes(self.employee, shift_end + timedelta(minutes=30, seconds=59), punch_in), 30)
 
     def test_half_day_uses_rounded_work_hours(self):
         start = local_instant("2026-10-12T09:00:00+05:30")
 
-        below_threshold = api.compute_work_hours(start, start + timedelta(seconds=16181))
-        at_rounded_threshold = api.compute_work_hours(start, start + timedelta(seconds=16182))
+        below_threshold = rules.compute_work_hours(start, start + timedelta(seconds=16181))
+        at_rounded_threshold = rules.compute_work_hours(start, start + timedelta(seconds=16182))
 
         self.assertEqual(below_threshold, 4.49)
-        self.assertTrue(api.compute_half_day(below_threshold))
+        self.assertTrue(rules.compute_half_day(below_threshold))
         self.assertEqual(at_rounded_threshold, 4.5)
-        self.assertFalse(api.compute_half_day(at_rounded_threshold))
+        self.assertFalse(rules.compute_half_day(at_rounded_threshold))
 
     def test_epoch_milliseconds_are_strict_and_whole_seconds_are_returned(self):
-        valid = api.PunchInRequest(emp_code="EMP90001", punched_at=1791909900123)
-        converted = api.epoch_ms_to_datetime(valid.punched_at)
+        valid = PunchInRequest(emp_code="EMP90001", punched_at=1791909900123)
+        converted = rules.epoch_ms_to_datetime(valid.punched_at)
 
         self.assertEqual(converted.microsecond, 0)
-        self.assertEqual(api.datetime_to_epoch_ms(converted), 1791909900000)
+        self.assertEqual(rules.datetime_to_epoch_ms(converted), 1791909900000)
         for invalid in (1791909900, 1791909900123.0, "1791909900123", 4102444800001):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(ValidationError):
-                    api.PunchInRequest.model_validate({"emp_code": "EMP90001", "punched_at": invalid})
+                    PunchInRequest.model_validate({"emp_code": "EMP90001", "punched_at": invalid})
 
     def test_invalid_calendar_dates_are_rejected(self):
         for invalid in ("not-a-date", "2026-02-30", "2026-2-03"):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(ValueError):
-                    api.parse_date_str(invalid)
+                    rules.parse_date_str(invalid)
 
 
 @unittest.skipIf(mongomock is None, "mongomock is required for isolated API tests")
 class AttendanceApiTests(unittest.TestCase):
     def setUp(self):
         self.client = mongomock.MongoClient(tz_aware=True)
-        self.original_db = api.db
-        api.db = self.client["attendance_unit_tests"]
-        api.ensure_indexes()
+        self.original_db = database.db
+        database.db = self.client[support.TEST_DATABASE]
+        database.ensure_indexes(database.db)
         self.employee("EMP90001")
 
     def tearDown(self):
-        api.db = self.original_db
+        database.db = self.original_db
         self.client.close()
 
     def employee(self, emp_code: str, shift_start: str = "09:00", shift_end: str = "18:00"):
-        return api.create_employee(api.EmployeeCreate(
+        return employees_create.create_employee(EmployeeCreate(
             emp_code=emp_code,
             name="Test Employee",
             email=f"{emp_code.lower()}@example.com",
@@ -119,11 +129,11 @@ class AttendanceApiTests(unittest.TestCase):
         ))
 
     def test_duplicate_punch_in_is_conflict(self):
-        request = api.PunchInRequest(emp_code="EMP90001", punched_at=1791776700000)
-        self.assertEqual(api.punch_in(request)["emp_code"], "EMP90001")
+        request = PunchInRequest(emp_code="EMP90001", punched_at=1791776700000)
+        self.assertEqual(attendance_punch_in.punch_in(request)["emp_code"], "EMP90001")
 
         with self.assertRaises(HTTPException) as raised:
-            api.punch_in(request)
+            attendance_punch_in.punch_in(request)
         self.assertEqual(raised.exception.status_code, 409)
 
     def test_duplicate_employee_code_is_conflict(self):
@@ -133,39 +143,39 @@ class AttendanceApiTests(unittest.TestCase):
 
     def test_unknown_employee_and_punch_out_without_punch_in(self):
         with self.assertRaises(HTTPException) as unknown:
-            api.punch_in(api.PunchInRequest(emp_code="EMP99999", punched_at=1791776700000))
+            attendance_punch_in.punch_in(PunchInRequest(emp_code="EMP99999", punched_at=1791776700000))
         self.assertEqual(unknown.exception.status_code, 404)
 
         with self.assertRaises(HTTPException) as no_record:
-            api.punch_out(api.PunchOutRequest(emp_code="EMP90001", punched_at=1791810000000))
+            attendance_punch_out.punch_out(PunchOutRequest(emp_code="EMP90001", punched_at=1791810000000))
         self.assertEqual(no_record.exception.status_code, 404)
 
     def test_invalid_order_and_more_than_24_hours_are_rejected(self):
-        punch_in = api.PunchInRequest(emp_code="EMP90001", punched_at=1791776700000)
-        api.punch_in(punch_in)
+        punch_in = PunchInRequest(emp_code="EMP90001", punched_at=1791776700000)
+        attendance_punch_in.punch_in(punch_in)
 
         for punch_out in (1791776700000, 1791863101000):
             with self.subTest(punch_out=punch_out):
                 with self.assertRaises(HTTPException) as raised:
-                    api.punch_out(api.PunchOutRequest(emp_code="EMP90001", punched_at=punch_out))
+                    attendance_punch_out.punch_out(PunchOutRequest(emp_code="EMP90001", punched_at=punch_out))
                 self.assertEqual(raised.exception.status_code, 422)
 
     def test_punch_out_exactly_24_hours_after_punch_in_is_allowed(self):
         self.employee("EMP90002")
-        api.punch_in(api.PunchInRequest(emp_code="EMP90002", punched_at=1791776700000))
-        punched_out = api.punch_out(api.PunchOutRequest(emp_code="EMP90002", punched_at=1791863100000))
+        attendance_punch_in.punch_in(PunchInRequest(emp_code="EMP90002", punched_at=1791776700000))
+        punched_out = attendance_punch_out.punch_out(PunchOutRequest(emp_code="EMP90002", punched_at=1791863100000))
 
         self.assertEqual(punched_out["work_hours"], 24.0)
 
     def test_duplicate_punch_out_does_not_overwrite_record(self):
-        api.punch_in(api.PunchInRequest(emp_code="EMP90001", punched_at=1791776700000))
-        first = api.punch_out(api.PunchOutRequest(emp_code="EMP90001", punched_at=1791810000000))
+        attendance_punch_in.punch_in(PunchInRequest(emp_code="EMP90001", punched_at=1791776700000))
+        first = attendance_punch_out.punch_out(PunchOutRequest(emp_code="EMP90001", punched_at=1791810000000))
         self.assertEqual(first["work_hours"], 9.25)
 
         with self.assertRaises(HTTPException) as raised:
-            api.punch_out(api.PunchOutRequest(emp_code="EMP90001", punched_at=1791813600000))
+            attendance_punch_out.punch_out(PunchOutRequest(emp_code="EMP90001", punched_at=1791813600000))
         self.assertEqual(raised.exception.status_code, 409)
-        listed = api.list_attendance(
+        listed = attendance_list.list_attendance(
             emp_code="EMP90001",
             date_from=None,
             date_to=None,
@@ -177,7 +187,7 @@ class AttendanceApiTests(unittest.TestCase):
 
     def test_reported_night_shift_regression_with_correct_epoch(self):
         self.employee("EMP90002", "22:00", "06:00")
-        result = api.punch_in(api.PunchInRequest(
+        result = attendance_punch_in.punch_in(PunchInRequest(
             emp_code="EMP90002",
             punched_at=1791909900000,
         ))
@@ -189,7 +199,7 @@ class AttendanceApiTests(unittest.TestCase):
     def test_employee_pagination_and_department_filter_totals(self):
         self.employee("EMP90002")
         self.employee("EMP90003")
-        page = api.list_employees(department="Testing", page=2, page_size=1)
+        page = employees_list.list_employees(department="Testing", page=2, page_size=1)
 
         self.assertEqual(page["total"], 3)
         self.assertEqual(page["page"], 2)
@@ -199,24 +209,24 @@ class AttendanceApiTests(unittest.TestCase):
 
     def test_overnight_punch_in_and_punch_out_use_shift_start_date(self):
         self.employee("EMP90002", "22:00", "06:00")
-        start = api.epoch_ms_to_datetime(1791909000000)
-        end = api.epoch_ms_to_datetime(1791939600000)
-        punched_in = api.punch_in(api.PunchInRequest(emp_code="EMP90002", punched_at=1791909000000))
-        punched_out = api.punch_out(api.PunchOutRequest(emp_code="EMP90002", punched_at=1791939600000))
+        start = rules.epoch_ms_to_datetime(1791909000000)
+        end = rules.epoch_ms_to_datetime(1791939600000)
+        punched_in = attendance_punch_in.punch_in(PunchInRequest(emp_code="EMP90002", punched_at=1791909000000))
+        punched_out = attendance_punch_out.punch_out(PunchOutRequest(emp_code="EMP90002", punched_at=1791939600000))
 
         self.assertEqual(punched_in["date"], "2026-10-13")
         self.assertEqual(punched_in["late_minutes"], 0)
         self.assertEqual(punched_out["date"], "2026-10-13")
-        self.assertEqual(punched_out["work_hours"], api.compute_work_hours(start, end))
+        self.assertEqual(punched_out["work_hours"], rules.compute_work_hours(start, end))
         self.assertEqual(punched_out["overtime_minutes"], 30)
 
     def test_regularization_recomputes_and_appends_audit_and_rejects_noop(self):
-        api.punch_in(api.PunchInRequest(emp_code="EMP90001", punched_at=1791776700000))
-        api.punch_out(api.PunchOutRequest(emp_code="EMP90001", punched_at=1791810000000))
-        corrected = api.regularize_attendance(
+        attendance_punch_in.punch_in(PunchInRequest(emp_code="EMP90001", punched_at=1791776700000))
+        attendance_punch_out.punch_out(PunchOutRequest(emp_code="EMP90001", punched_at=1791810000000))
+        corrected = attendance_regularize.regularize_attendance(
             "EMP90001",
             "2026-10-12",
-            api.RegularizeRequest(status="WFH", reason="Correct status", regularized_by="test-suite"),
+            RegularizeRequest(status="WFH", reason="Correct status", regularized_by="test-suite"),
         )
 
         self.assertEqual(corrected["history"][0]["changes"]["status"], {"from": "PRESENT", "to": "WFH"})
@@ -224,21 +234,101 @@ class AttendanceApiTests(unittest.TestCase):
         self.assertIsInstance(corrected["history"][0]["at"], int)
         self.assertEqual(corrected["work_hours"], 9.25)
         with self.assertRaises(HTTPException) as no_op:
-            api.regularize_attendance(
+            attendance_regularize.regularize_attendance(
                 "EMP90001",
                 "2026-10-12",
-                api.RegularizeRequest(status="WFH", reason="No change requested", regularized_by="test-suite"),
+                RegularizeRequest(status="WFH", reason="No change requested", regularized_by="test-suite"),
             )
         self.assertEqual(no_op.exception.status_code, 422)
 
+    def test_regularization_lateness_obeys_exact_ten_minute_grace_boundary(self):
+        self.employee("EMP90002", "09:30", "18:30")
+        record_date = "2026-10-14"
+        initial_punch = rules.datetime_to_epoch_ms(local_instant("2026-10-14T09:30:00+05:30"))
+        exact_grace_punch = rules.datetime_to_epoch_ms(local_instant("2026-10-14T09:40:00+05:30"))
+        after_grace_punch = rules.datetime_to_epoch_ms(local_instant("2026-10-14T09:40:01+05:30"))
+        attendance_punch_in.punch_in(PunchInRequest(emp_code="EMP90002", punched_at=initial_punch))
+
+        at_grace_boundary = attendance_regularize.regularize_attendance(
+            "EMP90002",
+            record_date,
+            RegularizeRequest(
+                punch_in=exact_grace_punch,
+                reason="Correct punch in",
+                regularized_by="test-suite",
+            ),
+        )
+        self.assertEqual(at_grace_boundary["late_minutes"], 0)
+
+        after_grace = attendance_regularize.regularize_attendance(
+            "EMP90002",
+            record_date,
+            RegularizeRequest(
+                punch_in=after_grace_punch,
+                reason="Correct punch in",
+                regularized_by="test-suite",
+            ),
+        )
+        self.assertEqual(after_grace["late_minutes"], 10)
+
+    def test_regularization_to_leave_clears_punch_times_and_records_audit(self):
+        attendance_punch_in.punch_in(PunchInRequest(emp_code="EMP90001", punched_at=1791776700000))
+        attendance_punch_out.punch_out(PunchOutRequest(emp_code="EMP90001", punched_at=1791810000000))
+
+        corrected = attendance_regularize.regularize_attendance(
+            "EMP90001",
+            "2026-10-12",
+            RegularizeRequest(
+                status="LEAVE",
+                reason="Approved leave",
+                regularized_by="test-suite",
+            ),
+        )
+
+        self.assertEqual(corrected["status"], "LEAVE")
+        self.assertIsNone(corrected["punch_in"])
+        self.assertIsNone(corrected["punch_out"])
+        self.assertIsNone(corrected["work_hours"])
+        self.assertEqual(corrected["late_minutes"], 0)
+        self.assertEqual(corrected["overtime_minutes"], 0)
+        self.assertFalse(corrected["half_day"])
+        self.assertEqual(corrected["history"][0]["changes"]["status"], {
+            "from": "PRESENT",
+            "to": "LEAVE",
+        })
+        self.assertEqual(corrected["history"][0]["reason"], "Approved leave")
+
+    def test_regularization_uses_legacy_defaults_when_building_audit_changes(self):
+        database.db.attendance_logs.insert_one({
+            "emp_code": "EMP90001",
+            "date": "2026-10-12",
+            "status": "PRESENT",
+            "punch_in": rules.epoch_ms_to_datetime(1791776700000),
+            "punch_out": None,
+        })
+
+        corrected = attendance_regularize.regularize_attendance(
+            "EMP90001",
+            "2026-10-12",
+            RegularizeRequest(status="WFH", reason="Correct status", regularized_by="test-suite"),
+        )
+
+        self.assertEqual(corrected["history"][0]["changes"], {
+            "status": {"from": "PRESENT", "to": "WFH"},
+            "late_minutes": {"from": 0, "to": 15},
+        })
+        self.assertEqual(corrected["late_minutes"], 15)
+        self.assertEqual(corrected["overtime_minutes"], 0)
+        self.assertFalse(corrected["half_day"])
+
     def test_invalid_attendance_date_filter_returns_422(self):
         with self.assertRaises(HTTPException) as raised:
-            api.list_attendance(emp_code=None, date_from="2026-02-30", page=1, page_size=20)
+            attendance_list.list_attendance(emp_code=None, date_from="2026-02-30", page=1, page_size=20)
         self.assertEqual(raised.exception.status_code, 422)
 
     def test_attendance_date_range_is_inclusive_and_reversed_range_fails(self):
-        api.punch_in(api.PunchInRequest(emp_code="EMP90001", punched_at=1791776700000))
-        matches = api.list_attendance(
+        attendance_punch_in.punch_in(PunchInRequest(emp_code="EMP90001", punched_at=1791776700000))
+        matches = attendance_list.list_attendance(
             emp_code="EMP90001",
             date_from="2026-10-12",
             date_to="2026-10-12",
@@ -249,7 +339,7 @@ class AttendanceApiTests(unittest.TestCase):
         self.assertEqual(matches["total"], 1)
 
         with self.assertRaises(HTTPException) as raised:
-            api.list_attendance(
+            attendance_list.list_attendance(
                 emp_code="EMP90001",
                 date_from="2026-10-13",
                 date_to="2026-10-12",

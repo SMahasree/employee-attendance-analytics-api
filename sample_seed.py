@@ -7,17 +7,13 @@ Equivalent with the MongoDB tools:
 
 The samples show document SHAPES only. The grader uses a much larger hidden dataset with cases they do not show.
 Passing on this sample does not mean your analytics are correct - re-read the business rules."""
-import os
 import pathlib
 
 from bson import json_util
-from dotenv import load_dotenv
-from pymongo import MongoClient
+from app.core.database import db
 
-load_dotenv()
 here = pathlib.Path(__file__).parent / "sample_data"
 opts = json_util.JSONOptions(tz_aware=True)
-db = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"), tz_aware=True)[os.getenv("MONGO_DB", "attendance_db")]
 
 for name in ("employees", "attendance_logs"):
     docs = json_util.loads((here / f"{name}.json").read_text(), json_options=opts)
